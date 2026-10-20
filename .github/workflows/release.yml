@@ -4,6 +4,10 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create
+        default: v0.1.0
 
 permissions:
   contents: write
@@ -31,8 +35,11 @@ jobs:
           name: tsr-windows-x86_64
           path: tsr-windows-x86_64.zip
       - uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: tsr ${{ inputs.tag || github.ref_name }}
           files: |
             tsr-windows-x86_64.zip
             target/release/tsr.exe
