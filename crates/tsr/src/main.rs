@@ -49,7 +49,7 @@ struct UpArgs {
     /// Name shown in the tailnet. Defaults to this computer's name.
     #[arg(long)]
     hostname: Option<String>,
-    /// UDP port for WireGuard and disco.
+    /// UDP port for WireGuard and disco. Falls back to a random port if taken.
     #[arg(long, default_value_t = 41641)]
     port: u16,
     /// Name of the virtual network adapter.
@@ -66,6 +66,8 @@ struct UpArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        // Colour codes show up as garbage in older Windows consoles.
+        .with_ansi(cfg!(not(windows)))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,h2=warn".into()),
@@ -121,7 +123,9 @@ async fn up(a: UpArgs) -> Result<()> {
     let mut client = ControlClient::connect(&a.login_server, &st.machine_key).await?;
     register(&mut client, &st, &hostinfo, a.auth_key.clone()).await?;
 
-    let endpoints = local_endpoints(a.port);
+    let sock = tsr_net::engine::bind(a.port).await?;
+    let port = sock.local_addr()?.port();
+    let endpoints = local_endpoints(port);
     tracing::info!(?endpoints, "advertising endpoints");
     let map_req = MapRequest {
         version: CAPABILITY_VERSION,
@@ -169,7 +173,7 @@ async fn up(a: UpArgs) -> Result<()> {
     let engine = tsr_net::engine::spawn(
         st.node_key.0,
         disco_key.0,
-        a.port,
+        sock,
         channels.from_os,
         channels.to_os,
     )
@@ -209,7 +213,7 @@ async fn up(a: UpArgs) -> Result<()> {
         // Reconnect, keeping the engine and its sessions.
         stream = loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            match reconnect(&a, &st, &map_req).await {
+            match reconnect(&a, &st, &map_req, port).await {
                 Ok(s) => break s,
                 Err(e) => tracing::warn!("reconnect: {e:#}"),
             }
@@ -221,10 +225,11 @@ async fn reconnect(
     a: &UpArgs,
     st: &state::State,
     req: &MapRequest,
+    port: u16,
 ) -> Result<tsr_control::client::MapStream> {
     let mut c = ControlClient::connect(&a.login_server, &st.machine_key).await?;
     let mut req = req.clone();
-    req.endpoints = local_endpoints(a.port);
+    req.endpoints = local_endpoints(port);
     start_map(&mut c, &req).await
 }
 

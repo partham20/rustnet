@@ -95,20 +95,32 @@ struct Engine {
     to_os: mpsc::Sender<Vec<u8>>,
 }
 
-/// Start the engine on its own task.
+/// Bind the WireGuard/disco UDP socket, falling back to any free port when
+/// `port` is taken (for example by the official Tailscale client).
+pub async fn bind(port: u16) -> Result<UdpSocket> {
+    let addr = |p| SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), p);
+    match UdpSocket::bind(addr(port)).await {
+        Ok(s) => Ok(s),
+        Err(e) if port != 0 => {
+            tracing::warn!("UDP port {port} unavailable ({e}); using a random port");
+            Ok(UdpSocket::bind(addr(0)).await?)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Start the engine on its own task, using a socket from [`bind`].
 ///
 /// * `from_os`: IP packets the OS wants to send into the tailnet.
 /// * `to_os`: decrypted IP packets for the OS.
 pub async fn spawn(
     node_private: [u8; 32],
     disco_private: [u8; 32],
-    listen_port: u16,
+    sock: UdpSocket,
     mut from_os: mpsc::Receiver<Vec<u8>>,
     to_os: mpsc::Sender<Vec<u8>>,
 ) -> Result<EngineHandle> {
-    let sock = Arc::new(
-        UdpSocket::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), listen_port)).await?,
-    );
+    let sock = Arc::new(sock);
     let local_addr = sock.local_addr()?;
     let static_private = StaticSecret::from(node_private);
     let static_public = PublicKey::from(&static_private);
