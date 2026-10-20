@@ -88,6 +88,15 @@ enum Src {
     Derp { region: i32, key: [u8; 32] },
 }
 
+impl std::fmt::Display for Src {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Src::Udp(a) => write!(f, "direct {a}"),
+            Src::Derp { region, .. } => write!(f, "DERP region {region}"),
+        }
+    }
+}
+
 struct Peer {
     cfg: PeerConfig,
     tunn: Tunn,
@@ -96,6 +105,8 @@ struct Peer {
     path_seen: Instant,
     last_ping: Option<Instant>,
     last_active: Option<Instant>,
+    /// A WireGuard session is up (for logging transitions only).
+    connected: bool,
     /// Pings we sent and are waiting on: txid -> destination.
     pings: HashMap<disco::TxId, SocketAddr>,
 }
@@ -108,6 +119,14 @@ impl Peer {
     fn active(&self) -> bool {
         self.last_active
             .is_some_and(|t| t.elapsed() < ACTIVE_WINDOW)
+    }
+
+    fn via(&self, derp_only: bool) -> String {
+        match self.path().filter(|_| !derp_only) {
+            Some(p) => format!("direct {p}"),
+            None if self.cfg.derp_region != 0 => format!("DERP region {}", self.cfg.derp_region),
+            None => format!("{} candidate endpoints", self.cfg.endpoints.len()),
+        }
     }
 
     fn candidates(&self) -> impl Iterator<Item = SocketAddr> + '_ {
@@ -272,6 +291,7 @@ impl Engine {
                     path_seen: Instant::now(),
                     last_ping: None,
                     last_active: None,
+                    connected: false,
                     pings: HashMap::new(),
                 },
             );
@@ -347,6 +367,7 @@ impl Engine {
             _ => None,
         };
         if !was_active {
+            tracing::info!(peer = %peer.cfg.name, %dst, via = %peer.via(self.opts.derp_only), "connecting");
             // Waking up an idle peer: start looking for a direct path now.
             self.disco_ping(&key).await;
         }
@@ -399,6 +420,10 @@ impl Engine {
             let ok = !matches!(res, TunnResult::Err(_));
             if ok {
                 peer.last_active = Some(Instant::now());
+                if !peer.connected && !matches!(res, TunnResult::Done) {
+                    peer.connected = true;
+                    tracing::info!(peer = %peer.cfg.name, via = %src, "WireGuard session up");
+                }
                 if let Src::Udp(addr) = src {
                     // Authenticated WireGuard from this address: it's a working path.
                     peer.path = Some(addr);
@@ -542,6 +567,12 @@ impl Engine {
             let due = peer.last_ping.is_none_or(|t| t.elapsed() >= interval);
             let timer_out = match peer.tunn.update_timers(&mut out) {
                 TunnResult::WriteToNetwork(d) => Some(d.to_vec()),
+                TunnResult::Err(boringtun::noise::errors::WireGuardError::ConnectionExpired) => {
+                    tracing::warn!(peer = %peer.cfg.name, via = %peer.via(self.opts.derp_only), "no answer from peer; giving up until there is new traffic");
+                    peer.connected = false;
+                    peer.last_active = None;
+                    None
+                }
                 TunnResult::Err(e) => {
                     tracing::trace!("timers: {e:?}");
                     None
