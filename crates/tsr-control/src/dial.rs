@@ -44,6 +44,13 @@ pub async fn connect(server: &Url) -> Result<Box<dyn Stream>> {
         "https" => {
             let mut roots = rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            // Extra trusted roots, e.g. a home CA that signed Headscale's certificate.
+            if let Some(path) = std::env::var_os("TSR_CA_FILE") {
+                use rustls::pki_types::{pem::PemObject, CertificateDer};
+                for cert in CertificateDer::pem_file_iter(&path).context("reading TSR_CA_FILE")? {
+                    roots.add(cert.context("parsing TSR_CA_FILE")?)?;
+                }
+            }
             let config = rustls::ClientConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))
@@ -69,7 +76,7 @@ fn host_header(server: &Url) -> String {
 }
 
 /// Read an HTTP/1.1 response head. Returns (status, headers, leftover body bytes).
-async fn read_head(s: &mut dyn Stream) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+pub async fn read_head(s: &mut dyn Stream) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     let end = loop {

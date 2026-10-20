@@ -9,16 +9,17 @@ mod state;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tsr_control::client::ControlClient;
 use tsr_control::tailcfg::{
-    Hostinfo, MapRequest, MapResponse, Node, NodeId, RegisterRequest, RegisterResponseAuth,
+    DerpMap, Hostinfo, MapRequest, MapResponse, NetInfo, Node, NodeId, RegisterRequest,
+    RegisterResponseAuth,
 };
 use tsr_control::CAPABILITY_VERSION;
-use tsr_net::engine::PeerConfig;
+use tsr_net::engine::{Options, PeerConfig};
 use tsr_net::{packet, tun};
 use url::Url;
 
@@ -61,6 +62,9 @@ struct UpArgs {
     /// Send ICMP echo requests through the tunnel to this tailnet IP and print replies.
     #[arg(long)]
     ping: Option<Ipv4Addr>,
+    /// Relay everything through DERP, never direct UDP (for testing).
+    #[arg(long, hide = true)]
+    derp_only: bool,
 }
 
 #[tokio::main]
@@ -70,7 +74,7 @@ async fn main() -> Result<()> {
         .with_ansi(cfg!(not(windows)))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,h2=warn".into()),
+                .unwrap_or_else(|_| "info,h2=warn,boringtun=error".into()),
         )
         .init();
     match Cli::parse().cmd {
@@ -92,26 +96,77 @@ fn default_hostname() -> String {
         .to_lowercase()
 }
 
-/// Local IPv4 addresses peers might reach us on, paired with our UDP port.
-fn local_endpoints(port: u16) -> Vec<String> {
-    let cgnat: ipnet::Ipv4Net = "100.64.0.0/10".parse().unwrap();
-    if_addrs::get_if_addrs()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|i| match i.ip() {
-            IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_link_local() && !cgnat.contains(&v4) => {
-                Some(v4)
-            }
-            _ => None,
-        })
-        .map(|ip| SocketAddr::new(ip.into(), port).to_string())
+/// Endpoints to advertise, as the `ip:port` strings control expects.
+fn local_endpoints(port: u16, derp_only: bool) -> Vec<String> {
+    if derp_only {
+        return Vec::new();
+    }
+    tsr_net::local_endpoints(port)
+        .iter()
+        .map(|e| e.to_string())
         .collect()
+}
+
+/// Pick the DERP region with the fastest TCP connect, a cheap stand-in for
+/// Tailscale's netcheck. Returns 0 if none answer.
+async fn select_home_derp(map: &DerpMap) -> i32 {
+    let mut probes = tokio::task::JoinSet::new();
+    for r in map
+        .regions
+        .values()
+        .filter(|r| !r.avoid && !r.no_measure_no_home)
+    {
+        let Some(node) = r.nodes.iter().find(|n| !n.stun_only) else {
+            continue;
+        };
+        let Ok(url) = node.url().parse::<Url>() else {
+            continue;
+        };
+        let (Some(host), Some(port)) = (
+            url.host_str().map(str::to_string),
+            url.port_or_known_default(),
+        ) else {
+            continue;
+        };
+        let region = r.region_id;
+        probes.spawn(async move {
+            let start = Instant::now();
+            let conn = tokio::time::timeout(
+                Duration::from_secs(3),
+                tokio::net::TcpStream::connect((host, port)),
+            )
+            .await;
+            matches!(conn, Ok(Ok(_))).then(|| (start.elapsed(), region))
+        });
+    }
+    let mut best: Option<(Duration, i32)> = None;
+    while let Some(r) = probes.join_next().await {
+        if let Ok(Some(found)) = r {
+            if best.is_none_or(|b| found.0 < b.0) {
+                best = Some(found);
+            }
+        }
+    }
+    match best {
+        Some((latency, region)) => {
+            let code = map
+                .regions
+                .get(&region.to_string())
+                .map(|r| r.region_code.clone())
+                .unwrap_or_default();
+            tracing::info!(region, %code, ?latency, "home DERP region");
+            region
+        }
+        None => {
+            tracing::warn!("no DERP region reachable; only direct connections will work");
+            0
+        }
+    }
 }
 
 async fn up(a: UpArgs) -> Result<()> {
     let st = state::State::load_or_create(&a.state)?;
-    // A fresh disco key each run is what Tailscale does too.
-    let disco_key = tsr_control::keys::PrivateKey::generate();
+    let disco_key = st.disco_key.clone();
     let hostinfo = Hostinfo {
         hostname: a.hostname.clone().unwrap_or_else(default_hostname),
         os: std::env::consts::OS.into(),
@@ -125,9 +180,9 @@ async fn up(a: UpArgs) -> Result<()> {
 
     let sock = tsr_net::engine::bind(a.port).await?;
     let port = sock.local_addr()?.port();
-    let endpoints = local_endpoints(port);
+    let endpoints = local_endpoints(port, a.derp_only);
     tracing::info!(?endpoints, "advertising endpoints");
-    let map_req = MapRequest {
+    let mut map_req = MapRequest {
         version: CAPABILITY_VERSION,
         node_key: st.node_key.node_public(),
         disco_key: disco_key.disco_public(),
@@ -156,6 +211,23 @@ async fn up(a: UpArgs) -> Result<()> {
         .context("no IPv4 tailnet address assigned")?;
     println!("Connected as {} with address {my_v4}", me.name);
 
+    let derp_map = first.derp_map.clone().unwrap_or_default();
+    let home_derp = select_home_derp(&derp_map).await;
+    if home_derp != 0 {
+        // Tell control (and so every peer) where to relay to us.
+        map_req.hostinfo.net_info = Some(NetInfo {
+            preferred_derp: home_derp,
+        });
+        let update = MapRequest {
+            stream: false,
+            omit_peers: true,
+            keep_alive: false,
+            ..map_req.clone()
+        };
+        let mut s = client.map(&update).await.context("reporting home DERP")?;
+        while s.next().await?.is_some() {}
+    }
+
     // With --no-tun, packets go to and from in-process channels instead of the OS.
     let (channels, test_io) = if a.no_tun {
         let (c, inject, received) = tun::detached();
@@ -170,14 +242,14 @@ async fn up(a: UpArgs) -> Result<()> {
         (c, None)
     };
 
-    let engine = tsr_net::engine::spawn(
-        st.node_key.0,
-        disco_key.0,
-        sock,
-        channels.from_os,
-        channels.to_os,
-    )
-    .await?;
+    let opts = Options {
+        node_private: st.node_key.0,
+        disco_private: disco_key.0,
+        derp_map,
+        home_derp,
+        derp_only: a.derp_only,
+    };
+    let engine = tsr_net::engine::spawn(opts, sock, channels.from_os, channels.to_os).await?;
     tracing::info!(local = %engine.local_addr, "WireGuard engine listening");
 
     if let Some(target) = a.ping {
@@ -229,7 +301,7 @@ async fn reconnect(
 ) -> Result<tsr_control::client::MapStream> {
     let mut c = ControlClient::connect(&a.login_server, &st.machine_key).await?;
     let mut req = req.clone();
-    req.endpoints = local_endpoints(port);
+    req.endpoints = local_endpoints(port, a.derp_only);
     start_map(&mut c, &req).await
 }
 
@@ -317,6 +389,9 @@ impl Netmap {
                 if let Some(k) = patch.disco_key {
                     p.disco_key = k;
                 }
+                if patch.derp_region != 0 {
+                    p.home_derp = patch.derp_region;
+                }
                 if patch.online.is_some() {
                     p.online = patch.online;
                 }
@@ -338,6 +413,7 @@ impl Netmap {
                     p.allowed_ips.clone()
                 },
                 endpoints: p.endpoints.iter().filter_map(|e| e.parse().ok()).collect(),
+                derp_region: p.derp_region(),
             })
             .collect()
     }

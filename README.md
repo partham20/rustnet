@@ -1,8 +1,8 @@
 # tsr: a small Tailscale client in Rust, for Windows
 
-`tsr` joins a Tailscale network (tailnet) run by a self-hosted
-[Headscale](https://github.com/juanfont/headscale) server and brings up a
-WireGuard tunnel through a Wintun adapter. It speaks the real Tailscale
+`tsr` joins a Tailscale network (tailnet), run either by tailscale.com or by
+a self-hosted [Headscale](https://github.com/juanfont/headscale) server, and
+brings up a WireGuard tunnel through a Wintun adapter. It speaks the real Tailscale
 protocols, so it talks to stock Tailscale clients on your other machines.
 
 It is a home project, not a replacement for the official client. Read
@@ -16,13 +16,18 @@ Tested on 2026-10-20 against Headscale 0.26.1 and an unmodified `tailscaled`
 - Registration with a pre-auth key or an interactive login URL.
 - The control channel: `/key`, the `/ts2021` upgrade, the Noise IK handshake,
   HTTP/2 inside it, and the streaming map poll with incremental updates.
-- Disco ping/pong to find a direct UDP path, in both directions.
+- Disco ping/pong to find a direct UDP path, in both directions, plus
+  call-me-maybe through DERP to ask far-away peers to ping back.
+- DERP relays: picks the nearest region, reports it to control, and relays
+  traffic for peers it can't reach directly. Tested relay-only (`--derp-only`)
+  with ping and HTTP both ways.
 - WireGuard (via boringtun) to every peer, routed by AllowedIPs.
 - ICMP and TCP both ways: OS `ping` from us to the peer, `tailscale ping`
   from the peer to us, and an HTTP request from the peer to a server behind
   our tunnel.
-- `tsr.exe` cross-compiles cleanly for `x86_64-pc-windows-gnu` and links only
-  system DLLs. The Wintun path has **not** been run on real Windows yet.
+- On real Windows 11 it signs in to tailscale.com, creates the Wintun
+  adapter and loads the netmap. Traffic to a peer on Windows hasn't been
+  confirmed yet.
 
 ## Running it on Windows
 
@@ -47,10 +52,14 @@ Useful flags:
 - `--no-tun --ping 100.64.0.4` exercises the whole path without creating an
   adapter, so no admin rights or wintun.dll are needed.
 - `RUST_LOG=debug` turns on detailed logs.
+- `TSR_CA_FILE=ca.pem` trusts an extra CA, for a Headscale server with a
+  certificate from your own home CA.
+- If UDP 41641 is taken (for example by the official Tailscale app), a random
+  port is used instead. Quit the official app anyway: both claim 100.x routes.
 
-The first packets to a peer can take 5 to 20 seconds after startup while
-Headscale tells the peer about our new disco key. After that, round trips on
-a LAN are around 1 ms.
+On the very first run, the first packets to a peer can take up to 20 seconds
+while the control server tells it about us. Later runs reuse the same keys
+and connect at once. Round trips on a LAN are around 1 ms.
 
 ## Building
 
@@ -67,14 +76,15 @@ On Windows with MSVC, a plain `cargo build --release` works.
 | Crate | What it does |
 |---|---|
 | `crates/tsr-control` | Keys (`mkey:`, `nodekey:`, `discokey:`), the Noise handshake and record layer (`noise.rs`), the `/ts2021` dial (`dial.rs`), the JSON wire types (`tailcfg.rs`), and register/map over HTTP/2 (`client.rs`). |
-| `crates/tsr-net` | The WireGuard engine (`engine.rs`), disco (`disco.rs`), and the TUN device: Wintun on Windows, `/dev/net/tun` on Linux for development. |
+| `crates/tsr-net` | The WireGuard engine (`engine.rs`), disco (`disco.rs`), the DERP client (`derp.rs`), and the TUN device: Wintun on Windows, `/dev/net/tun` on Linux for development. |
 | `crates/tsr` | The `tsr up` command: state file, login flow, netmap bookkeeping, reconnects. |
 
 How a packet travels: the OS writes an IP packet to the adapter. The engine
 picks the peer whose AllowedIPs match the destination, encrypts it with that
 peer's boringtun session, and sends it over UDP to the path that disco
-confirmed. Incoming UDP is either disco (magic `TS💬`) or WireGuard. WireGuard
-packets are decrypted and written back to the adapter.
+confirmed, or through the peer's home DERP region until there is one.
+Incoming UDP and DERP traffic is either disco (magic `TS💬`) or WireGuard.
+WireGuard packets are decrypted and written back to the adapter.
 
 ### Protocol notes worth knowing
 
@@ -85,6 +95,8 @@ packets are decrypted and written back to the adapter.
   how to reach you. `start_map` sends it before opening the stream.
 - A real Tailscale peer drops WireGuard packets from an `ip:port` until a disco
   ping from that address has tied it to our node key.
+- When a peer sees our disco key change, it throws away its WireGuard session
+  with us. That is why `tsr` keeps the disco key in its state file.
 
 ## Not done yet (roadmap)
 
@@ -92,9 +104,8 @@ Roughly in order of usefulness for a home network:
 
 1. **Run on real Windows.** Check Wintun adapter creation, addressing via
    netsh, and the firewall prompt for UDP 41641.
-2. **DERP relay.** Today both ends need direct UDP reachability. That's fine on
-   one LAN, but it fails across NATs (phone on mobile data, say). DERP plus
-   STUN-discovered endpoints fixes that.
+2. **STUN.** We only advertise LAN addresses, so peers behind other NATs talk
+   to us through DERP (slower) instead of punching a direct path.
 3. **Packet filter.** We don't enforce the tailnet ACLs on inbound traffic;
    any peer can reach any port the Windows firewall allows.
 4. **Run as a Windows service** that starts at boot, with the state file in

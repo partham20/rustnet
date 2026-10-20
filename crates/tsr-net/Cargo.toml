@@ -14,6 +14,8 @@ ipnet.workspace = true
 rand.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+url.workspace = true
+tsr-control = { path = "../tsr-control" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

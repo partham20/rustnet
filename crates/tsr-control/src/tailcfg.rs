@@ -39,6 +39,70 @@ pub struct Hostinfo {
     pub hostname: String,
     #[serde(skip_serializing_if = "String::is_empty", default)]
     pub go_arch: String,
+    #[serde(rename = "NetInfo", skip_serializing_if = "Option::is_none", default)]
+    pub net_info: Option<NetInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NetInfo {
+    /// Home DERP region: where peers send to us when there is no direct path.
+    #[serde(rename = "PreferredDERP", default)]
+    pub preferred_derp: i32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct DerpMap {
+    /// Keyed by region ID as a decimal string (Go marshals map[int] that way).
+    #[serde(deserialize_with = "null_default")]
+    pub regions: std::collections::BTreeMap<String, DerpRegion>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct DerpRegion {
+    #[serde(rename = "RegionID")]
+    pub region_id: i32,
+    pub region_code: String,
+    pub region_name: String,
+    pub avoid: bool,
+    pub no_measure_no_home: bool,
+    #[serde(deserialize_with = "null_default")]
+    pub nodes: Vec<DerpNode>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct DerpNode {
+    pub name: String,
+    #[serde(rename = "RegionID")]
+    pub region_id: i32,
+    pub host_name: String,
+    #[serde(rename = "IPv4")]
+    pub ipv4: String,
+    #[serde(rename = "STUNOnly")]
+    pub stun_only: bool,
+    /// 0 means 443.
+    #[serde(rename = "DERPPort")]
+    pub derp_port: u16,
+    /// Plain HTTP instead of TLS; used by test setups such as Headscale over http.
+    pub insecure_for_tests: bool,
+}
+
+impl DerpNode {
+    pub fn url(&self) -> String {
+        let (scheme, default_port) = if self.insecure_for_tests {
+            ("http", 80)
+        } else {
+            ("https", 443)
+        };
+        let port = if self.derp_port == 0 {
+            default_port
+        } else {
+            self.derp_port
+        };
+        format!("{scheme}://{}:{port}/derp", self.host_name)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -122,6 +186,19 @@ pub struct Node {
     pub expired: bool,
 }
 
+impl Node {
+    /// Home DERP region, from HomeDERP or the legacy "127.3.3.40:N" string.
+    pub fn derp_region(&self) -> i32 {
+        if self.home_derp != 0 {
+            return self.home_derp;
+        }
+        self.derp
+            .strip_prefix("127.3.3.40:")
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(0)
+    }
+}
+
 /// Incremental change to one peer (MapResponse.PeersChangedPatch).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
@@ -150,7 +227,7 @@ pub struct MapResponse {
     #[serde(deserialize_with = "null_default")]
     pub peers_changed_patch: Vec<PeerChange>,
     #[serde(rename = "DERPMap")]
-    pub derp_map: Option<serde_json::Value>,
+    pub derp_map: Option<DerpMap>,
     pub domain: String,
 }
 
@@ -167,7 +244,9 @@ mod tests {
             "Peers": [], "PeersRemoved": null, "DERPMap": {"Regions": {}}
         }"#;
         let m: MapResponse = serde_json::from_str(j).unwrap();
+        assert!(m.derp_map.as_ref().unwrap().regions.is_empty());
         let n = m.node.unwrap();
+        assert_eq!(n.derp_region(), 1);
         assert_eq!(n.id, 1);
         assert_eq!(n.addresses.len(), 2);
         assert!(n.allowed_ips.is_empty());

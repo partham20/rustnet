@@ -1375,6 +1375,8 @@ dependencies = [
  "rand",
  "tokio",
  "tracing",
+ "tsr-control",
+ "url",
  "wintun",
 ]
 
