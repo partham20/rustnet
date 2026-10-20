@@ -1,0 +1,20 @@
+[package]
+name = "tsr"
+description = "A small Tailscale-compatible client (works with Headscale), aimed at Windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+if-addrs.workspace = true
+ipnet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+tsr-control = { path = "../tsr-control" }
+tsr-net = { path = "../tsr-net" }

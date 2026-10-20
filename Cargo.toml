@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/tsr-control", "crates/tsr-net", "crates/tsr"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+blake2 = "0.10"
+bytes = "1"
+chacha20poly1305 = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+crypto_box = { version = "0.9", features = ["std"] }
+h2 = "0.4"
+hex = "0.4"
+hkdf = "0.12"
+http = "1"
+ipnet = { version = "2", features = ["serde"] }
+rand = "0.8"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+webpki-roots = "0.26"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+boringtun = "0.7"
+if-addrs = "0.13"
