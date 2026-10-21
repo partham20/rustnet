@@ -25,9 +25,8 @@ Tested on 2026-10-20 against Headscale 0.26.1 and an unmodified `tailscaled`
 - ICMP and TCP both ways: OS `ping` from us to the peer, `tailscale ping`
   from the peer to us, and an HTTP request from the peer to a server behind
   our tunnel.
-- On real Windows 11 it signs in to tailscale.com, creates the Wintun
-  adapter and loads the netmap. Traffic to a peer on Windows hasn't been
-  confirmed yet.
+- On Windows 11 it signs in to tailscale.com, creates the Wintun adapter
+  and shows as Connected in the admin console.
 
 ## Running it on Windows
 
@@ -60,6 +59,43 @@ Or use `scripts/start-tsr.ps1` (also attached to each release). Put it next to
 `tsr.exe`, then right-click it and choose "Run with PowerShell". It asks for
 admin rights, pauses the official Tailscale service while tsr runs, and starts
 that service again when tsr exits.
+
+### Running in the background
+
+To have tsr start with Windows and run with no window, put `start-tsr.ps1`
+next to `tsr.exe` and run, from any PowerShell window:
+
+```
+powershell -ExecutionPolicy Bypass -File .\start-tsr.ps1 -Install
+```
+
+It asks for admin rights once, then:
+
+- copies `tsr.exe` and the script to `C:\Program Files\tsr`;
+- keeps the keys and the log in `C:\ProgramData\tsr`, readable only by
+  Administrators and SYSTEM (it reuses `tsr.state.json` from the old folder,
+  so the PC keeps its tailnet name and address; otherwise it logs in first,
+  with `-AuthKey` or a login URL);
+- turns off the official Tailscale service, so it doesn't fight tsr for routes;
+- adds a firewall rule for tsr's UDP traffic;
+- creates a scheduled task, `tsr`, that runs as SYSTEM at boot and restarts tsr
+  if it exits.
+
+Then:
+
+- `start-tsr.ps1 -Status` shows whether it's running and the last log lines.
+  The full log is `C:\ProgramData\tsr\tsr.log`; at 10 MB it moves to `tsr.log.1`.
+- `start-tsr.ps1 -Install` again, with a newer `tsr.exe` next to the script,
+  updates it.
+- `start-tsr.ps1 -Uninstall` removes the task, the program folder and the
+  firewall rule, and turns the official Tailscale service back on. The keys
+  stay in `C:\ProgramData\tsr` until you delete that folder.
+
+For Headscale, add `-LoginServer http://headscale.lan:8080` to `-Install`.
+
+Underneath, the script uses two things in `tsr.exe`: `tsr login`, which
+registers and exits without bringing the tunnel up, and `--log-file <path>`,
+which sends logs to a file instead of the console.
 
 Useful flags:
 
@@ -116,16 +152,13 @@ WireGuard packets are decrypted and written back to the adapter.
 
 Roughly in order of usefulness for a home network:
 
-1. **Run on real Windows.** Check Wintun adapter creation, addressing via
-   netsh, and the firewall prompt for UDP 41641.
-2. **STUN.** We only advertise LAN addresses, so peers behind other NATs talk
+1. **STUN.** We only advertise LAN addresses, so peers behind other NATs talk
    to us through DERP (slower) instead of punching a direct path.
-3. **Packet filter.** We don't enforce the tailnet ACLs on inbound traffic;
+2. **Packet filter.** We don't enforce the tailnet ACLs on inbound traffic;
    any peer can reach any port the Windows firewall allows.
-4. **Run as a Windows service** that starts at boot, with the state file in
-   `%ProgramData%` and readable only by SYSTEM. The keys are plaintext JSON
-   today.
-5. **MagicDNS**, so names like `nas.home.arpa` work.
-6. IPv6 underlay sockets, zstd map compression, endpoint re-reporting when the
+3. **A real Windows service** instead of a scheduled task, plus encrypting
+   the keys (plaintext JSON today, protected only by folder permissions).
+4. **MagicDNS**, so names like `nas.home.arpa` work.
+5. IPv6 underlay sockets, zstd map compression, endpoint re-reporting when the
    LAN address changes, key expiry and re-login.
-7. Subnet routes and exit nodes.
+6. Subnet routes and exit nodes.

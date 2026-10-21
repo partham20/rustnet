@@ -57,7 +57,13 @@ jobs:
             `tsr` for Windows x86_64. `tsr.exe` works on its own (the Wintun driver DLL is built in); the zip adds the README. In an Administrator terminal:
 
             ```
-            tsr.exe up --login-server http://<headscale>:8080 --auth-key <key>
+            tsr.exe up --login-server https://controlplane.tailscale.com --auth-key <key>
+            ```
+
+            To run it in the background from boot, put `start-tsr.ps1` next to `tsr.exe` and run:
+
+            ```
+            powershell -ExecutionPolicy Bypass -File .\start-tsr.ps1 -Install
             ```
 
             See the README for details and current limitations.

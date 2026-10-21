@@ -2,8 +2,10 @@
 //!
 //! ```text
 //! tsr up --login-server http://headscale.lan:8080 --auth-key <key>
+//! tsr login --login-server https://controlplane.tailscale.com   # register, then exit
 //! ```
 
+mod logfile;
 mod state;
 
 use anyhow::{bail, Context, Result};
@@ -28,16 +30,22 @@ use url::Url;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Append logs to this file instead of printing them (for running in the background).
+    /// At 10 MB it is renamed to <file>.1 and a new one is started.
+    #[arg(long, global = true)]
+    log_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
     /// Log in (if needed), bring the tunnel up, and stay connected.
     Up(UpArgs),
+    /// Register this machine (if needed) and exit, without bringing the tunnel up.
+    Login(LoginArgs),
 }
 
 #[derive(clap::Args)]
-struct UpArgs {
+struct LoginArgs {
     /// Control server URL, e.g. http://headscale.lan:8080
     #[arg(long)]
     login_server: Url,
@@ -50,6 +58,12 @@ struct UpArgs {
     /// Name shown in the tailnet. Defaults to this computer's name.
     #[arg(long)]
     hostname: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct UpArgs {
+    #[command(flatten)]
+    login: LoginArgs,
     /// UDP port for WireGuard and disco. Falls back to a random port if taken.
     #[arg(long, default_value_t = 41641)]
     port: u16,
@@ -69,17 +83,53 @@ struct UpArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
+    let cli = Cli::parse();
+    let logs = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "info,h2=warn,boringtun=error".into()),
+    );
+    match &cli.log_file {
+        Some(path) => {
+            let file = logfile::LogFile::open(path)
+                .with_context(|| format!("opening log file {}", path.display()))?;
+            logs.with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+        }
         // Colour codes show up as garbage in older Windows consoles.
-        .with_ansi(cfg!(not(windows)))
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,h2=warn,boringtun=error".into()),
-        )
-        .init();
-    match Cli::parse().cmd {
-        Cmd::Up(a) => up(a).await,
+        None => logs.with_ansi(cfg!(not(windows))).init(),
     }
+    let result = match cli.cmd {
+        Cmd::Up(a) => up(a).await,
+        Cmd::Login(a) => login(a).await,
+    };
+    if let Err(e) = &result {
+        // Errors otherwise only reach stderr, which nobody sees in the background.
+        tracing::error!("{e:#}");
+    }
+    result
+}
+
+fn hostinfo(a: &LoginArgs) -> Hostinfo {
+    Hostinfo {
+        hostname: a.hostname.clone().unwrap_or_else(default_hostname),
+        os: std::env::consts::OS.into(),
+        go_arch: std::env::consts::ARCH.into(),
+        ipn_version: format!(
+            "{}-tsr{}",
+            tsr_control::TAILSCALE_VERSION,
+            env!("CARGO_PKG_VERSION")
+        ),
+        ..Default::default()
+    }
+}
+
+async fn login(a: LoginArgs) -> Result<()> {
+    let st = state::State::load_or_create(&a.state)?;
+    let mut client = ControlClient::connect(&a.login_server, &st.machine_key).await?;
+    register(&mut client, &st, &hostinfo(&a), a.auth_key.clone()).await?;
+    println!("Logged in. Keys saved to {}", a.state.display());
+    Ok(())
 }
 
 fn default_hostname() -> String {
@@ -165,22 +215,12 @@ async fn select_home_derp(map: &DerpMap) -> i32 {
 }
 
 async fn up(a: UpArgs) -> Result<()> {
-    let st = state::State::load_or_create(&a.state)?;
+    let st = state::State::load_or_create(&a.login.state)?;
     let disco_key = st.disco_key.clone();
-    let hostinfo = Hostinfo {
-        hostname: a.hostname.clone().unwrap_or_else(default_hostname),
-        os: std::env::consts::OS.into(),
-        go_arch: std::env::consts::ARCH.into(),
-        ipn_version: format!(
-            "{}-tsr{}",
-            tsr_control::TAILSCALE_VERSION,
-            env!("CARGO_PKG_VERSION")
-        ),
-        ..Default::default()
-    };
+    let hostinfo = hostinfo(&a.login);
 
-    let mut client = ControlClient::connect(&a.login_server, &st.machine_key).await?;
-    register(&mut client, &st, &hostinfo, a.auth_key.clone()).await?;
+    let mut client = ControlClient::connect(&a.login.login_server, &st.machine_key).await?;
+    register(&mut client, &st, &hostinfo, a.login.auth_key.clone()).await?;
 
     let sock = tsr_net::engine::bind(a.port).await?;
     let port = sock.local_addr()?.port();
@@ -213,7 +253,7 @@ async fn up(a: UpArgs) -> Result<()> {
             _ => None,
         })
         .context("no IPv4 tailnet address assigned")?;
-    println!("Connected as {} with address {my_v4}", me.name);
+    tracing::info!("connected as {} with address {my_v4}", me.name);
 
     let derp_map = first.derp_map.clone().unwrap_or_default();
     let home_derp = select_home_derp(&derp_map).await;
@@ -303,7 +343,7 @@ async fn reconnect(
     req: &MapRequest,
     port: u16,
 ) -> Result<tsr_control::client::MapStream> {
-    let mut c = ControlClient::connect(&a.login_server, &st.machine_key).await?;
+    let mut c = ControlClient::connect(&a.login.login_server, &st.machine_key).await?;
     let mut req = req.clone();
     req.endpoints = local_endpoints(port, a.derp_only);
     start_map(&mut c, &req).await
@@ -354,6 +394,8 @@ async fn register(
         bail!("server neither authorized this machine nor gave a login URL");
     }
     println!("\nTo authenticate, visit:\n\n\t{}\n", resp.auth_url);
+    // Also in the log, for when stdout goes nowhere.
+    tracing::info!(url = %resp.auth_url, "waiting for login");
     // The follow-up request blocks until the login completes.
     req.followup = resp.auth_url;
     req.auth = None;
