@@ -1,0 +1,35 @@
+name: prune-releases
+
+# Run by hand from the Actions tab. Deletes every release (and its tag)
+# except one: the latest release unless you name another tag.
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: Tag of the release to keep (empty = latest)
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: ${{ inputs.keep }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          if [ -z "$KEEP" ]; then
+            KEEP=$(gh release view -R "$repo" --json tagName -q .tagName)
+          fi
+          echo "Keeping $KEEP"
+          gh release list -R "$repo" --limit 200 --json tagName -q '.[].tagName' | while read -r tag; do
+            if [ "$tag" != "$KEEP" ]; then
+              echo "Deleting $tag"
+              gh release delete "$tag" -R "$repo" --yes --cleanup-tag
+            fi
+          done

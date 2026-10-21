@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/tsr-control", "crates/tsr-net", "crates/tsr"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.2"
 edition = "2021"
 license = "BSD-3-Clause"
 
