@@ -1,11 +1,12 @@
 <#
 .SYNOPSIS
-    Start tsr (the Rust Tailscale client) from your Downloads folder.
+    Start tsr (the Rust Tailscale client).
 
 .DESCRIPTION
     Re-launches itself as Administrator when needed. While tsr runs, it pauses
     the official Tailscale service, which would otherwise route all 100.x
     traffic to its own adapter. It starts the service again when tsr exits.
+    It looks for tsr.exe next to this script, then in your Downloads folder.
     Keys stay in tsr.state.json next to tsr.exe, so after the first run
     no auth key is needed.
 
@@ -20,12 +21,17 @@
 #>
 param(
     # Folder that holds tsr.exe (and tsr.state.json).
-    [string]$TsrDir = (Join-Path $env:USERPROFILE 'Downloads'),
+    [string]$TsrDir = '',
     [string]$LoginServer = 'https://controlplane.tailscale.com',
     [string]$AuthKey = ''
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not $TsrDir) {
+    $TsrDir = if (Test-Path (Join-Path $PSScriptRoot 'tsr.exe')) { $PSScriptRoot }
+              else { Join-Path $env:USERPROFILE 'Downloads' }
+}
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $isAdmin = ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
