@@ -171,7 +171,11 @@ async fn up(a: UpArgs) -> Result<()> {
         hostname: a.hostname.clone().unwrap_or_else(default_hostname),
         os: std::env::consts::OS.into(),
         go_arch: std::env::consts::ARCH.into(),
-        ipn_version: concat!("1.84.0-tsr", env!("CARGO_PKG_VERSION")).into(),
+        ipn_version: format!(
+            "{}-tsr{}",
+            tsr_control::TAILSCALE_VERSION,
+            env!("CARGO_PKG_VERSION")
+        ),
         ..Default::default()
     };
 

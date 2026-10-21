@@ -16,3 +16,10 @@ pub mod tailcfg;
 /// Capability version we advertise. Headscale and Tailscale's control server
 /// change response shapes based on this number, so bump it deliberately.
 pub const CAPABILITY_VERSION: u16 = 106;
+
+/// Tailscale release we present as in Hostinfo.IPNVersion, which is what the
+/// admin console shows and compares against the newest release to flag
+/// "update available". It is display-only: control decides protocol details
+/// from [`CAPABILITY_VERSION`], so this can track the latest stable release
+/// without promising features we lack. Bump it when Tailscale ships.
+pub const TAILSCALE_VERSION: &str = "1.104.1";
