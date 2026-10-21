@@ -1,5 +1,7 @@
-//! Wintun backend. Needs `wintun.dll` (from https://www.wintun.net) next to
-//! the executable, and Administrator rights to create the adapter.
+//! Wintun backend. Needs Administrator rights to create the adapter, and
+//! `wintun.dll` (from https://www.wintun.net): either next to the executable,
+//! or embedded at build time (see build.rs), in which case it is written next
+//! to the executable on first use.
 
 use anyhow::{Context, Result};
 use std::net::{IpAddr, Ipv4Addr};
@@ -8,10 +10,36 @@ use tokio::sync::mpsc;
 
 use super::{TunChannels, TunConfig};
 
+#[cfg(embed_wintun)]
+const WINTUN_DLL: &[u8] = include_bytes!(env!("TSR_WINTUN_DLL_PATH"));
+
+fn load_wintun() -> Result<wintun::Wintun> {
+    if let Ok(w) = unsafe { wintun::load() } {
+        return Ok(w);
+    }
+    #[cfg(embed_wintun)]
+    {
+        // Next to the exe, not in %TEMP%: that folder is exactly as trusted as
+        // the exe itself, so an elevated tsr won't load a DLL that a less
+        // trusted process could have planted.
+        let path = std::env::current_exe()?.with_file_name("wintun.dll");
+        if std::fs::read(&path).ok().as_deref() != Some(WINTUN_DLL) {
+            std::fs::write(&path, WINTUN_DLL)
+                .with_context(|| format!("writing {}", path.display()))?;
+            tracing::info!("extracted {}", path.display());
+        }
+        return unsafe { wintun::load_from_path(&path) }.context("loading the bundled wintun.dll");
+    }
+    #[allow(unreachable_code)]
+    {
+        anyhow::bail!(
+            "wintun.dll not found; download it from https://www.wintun.net and put it next to tsr.exe"
+        )
+    }
+}
+
 pub fn create(cfg: &TunConfig) -> Result<TunChannels> {
-    let wintun = unsafe { wintun::load() }.context(
-        "loading wintun.dll; download it from https://www.wintun.net and put it next to tsr.exe",
-    )?;
+    let wintun = load_wintun()?;
     let adapter = match wintun::Adapter::open(&wintun, &cfg.name) {
         Ok(a) => a,
         Err(_) => wintun::Adapter::create(&wintun, &cfg.name, "Tailscale-rs", None)

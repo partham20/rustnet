@@ -31,21 +31,30 @@ Tested on 2026-10-20 against Headscale 0.26.1 and an unmodified `tailscaled`
 
 ## Running it on Windows
 
-1. Run Headscale somewhere on your LAN (a Raspberry Pi or NAS is fine), then
-   create a user and a key:
-   `headscale users create home` and
+1. Get an auth key. For tailscale.com, generate one in the admin console under
+   Settings, then Keys, and use `--login-server https://controlplane.tailscale.com`.
+   For Headscale, run `headscale users create home` and
    `headscale preauthkeys create --user 1 --reusable --expiration 24h`.
-2. Download `wintun.dll` (amd64) from <https://www.wintun.net> and put it next
-   to `tsr.exe`.
-3. In an **Administrator** terminal:
+2. Download `tsr.exe` from the
+   [releases page](https://github.com/partham20/rustnet/releases/latest).
+   Release builds carry the Wintun driver DLL inside and write `wintun.dll`
+   next to the exe on first run. For your own builds, put `wintun.dll` (amd64,
+   from <https://www.wintun.net>) next to `tsr.exe`, or set `TSR_WINTUN_DLL` to
+   its path when building to embed it.
+3. If the official Tailscale app is installed, stop its service first, in an
+   Administrator terminal: `Stop-Service Tailscale`. Exiting the tray icon
+   isn't enough: the service keeps routing every 100.x address to its own
+   adapter. `Start-Service Tailscale` brings it back.
+4. In an **Administrator** terminal:
 
    ```
    tsr.exe up --login-server http://headscale.lan:8080 --auth-key <key>
    ```
 
-   Keys are kept in `tsr.state.json` (use `--state` to move it), so later runs
-   don't need `--auth-key`. Leave the key out to get a login URL instead.
-4. From another terminal, `ping 100.64.0.x` for any peer.
+   Keys are kept in `tsr.state.json` in the current folder (use `--state` to
+   move it), so later runs don't need `--auth-key` and keep the same device
+   name. Leave the key out to get a login URL instead.
+5. From another terminal, `ping 100.x.y.z` for any peer.
 
 Useful flags:
 
