@@ -56,6 +56,11 @@ Tested on 2026-10-20 against Headscale 0.26.1 and an unmodified `tailscaled`
    name. Leave the key out to get a login URL instead.
 5. From another terminal, `ping 100.x.y.z` for any peer.
 
+Or use `scripts/start-tsr.ps1` (also attached to each release). Put it next to
+`tsr.exe`, then right-click it and choose "Run with PowerShell". It asks for
+admin rights, pauses the official Tailscale service while tsr runs, and starts
+that service again when tsr exits.
+
 Useful flags:
 
 - `--no-tun --ping 100.64.0.4` exercises the whole path without creating an
