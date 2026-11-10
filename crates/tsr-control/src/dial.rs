@@ -7,7 +7,6 @@ use base64::Engine;
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
-use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use url::Url;
 
@@ -35,7 +34,7 @@ pub async fn connect(server: &Url) -> Result<Box<dyn Stream>> {
     let port = server
         .port_or_known_default()
         .context("server URL has no port")?;
-    let tcp = TcpStream::connect((host.as_str(), port))
+    let tcp = crate::bypass::tcp_connect(&host, port)
         .await
         .with_context(|| format!("connecting to {host}:{port}"))?;
     tcp.set_nodelay(true)?;

@@ -60,6 +60,10 @@ pub fn create(cfg: &TunConfig) -> Result<TunChannels> {
         .set_mtu(usize::from(cfg.mtu))
         .context("setting adapter MTU")?;
 
+    let ifindex = adapter
+        .get_adapter_index()
+        .context("reading the adapter's interface index")?;
+
     let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY)?);
     let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(1024);
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(1024);
@@ -105,5 +109,84 @@ pub fn create(cfg: &TunConfig) -> Result<TunChannels> {
     Ok(TunChannels {
         from_os: in_rx,
         to_os: out_tx,
+        ifindex,
     })
+}
+
+use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetIpForwardTable2,
+    GetIpInterfaceEntry, InitializeIpForwardEntry, InitializeIpInterfaceEntry, MIB_IPFORWARD_ROW2,
+    MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
+};
+use windows_sys::Win32::Networking::WinSock::{AF_INET, MIB_IPPROTO_NETMGMT};
+
+fn route_row(ifindex: u32, net: ipnet::Ipv4Net) -> MIB_IPFORWARD_ROW2 {
+    let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+    unsafe { InitializeIpForwardEntry(&mut row) };
+    row.InterfaceIndex = ifindex;
+    row.DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
+    row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr =
+        u32::from_ne_bytes(net.network().octets());
+    row.DestinationPrefix.PrefixLength = net.prefix_len();
+    // On-link: an all-zero IPv4 next hop.
+    row.NextHop.Ipv4.sin_family = AF_INET;
+    row.Metric = 0;
+    row.Protocol = MIB_IPPROTO_NETMGMT;
+    row
+}
+
+pub fn add_route(_name: &str, ifindex: u32, net: ipnet::Ipv4Net) -> Result<()> {
+    let row = route_row(ifindex, net);
+    match unsafe { CreateIpForwardEntry2(&row) } {
+        NO_ERROR | ERROR_OBJECT_ALREADY_EXISTS => Ok(()),
+        e => Err(std::io::Error::from_raw_os_error(e as i32)).context("CreateIpForwardEntry2"),
+    }
+}
+
+pub fn del_route(_name: &str, ifindex: u32, net: ipnet::Ipv4Net) -> Result<()> {
+    let row = route_row(ifindex, net);
+    match unsafe { DeleteIpForwardEntry2(&row) } {
+        NO_ERROR | ERROR_NOT_FOUND => Ok(()),
+        e => Err(std::io::Error::from_raw_os_error(e as i32)).context("DeleteIpForwardEntry2"),
+    }
+}
+
+/// The interface Windows itself would pick for the internet: the IPv4 default
+/// route with the lowest route + interface metric, skipping `exclude`.
+pub fn default_interface(exclude: u32) -> Option<u32> {
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    if unsafe { GetIpForwardTable2(AF_INET, &mut table) } != NO_ERROR || table.is_null() {
+        return None;
+    }
+    let rows = unsafe {
+        std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+    };
+    let best = rows
+        .iter()
+        .filter(|r| {
+            r.DestinationPrefix.PrefixLength == 0
+                && r.InterfaceIndex != 0
+                && r.InterfaceIndex != exclude
+        })
+        .filter_map(|r| {
+            let iface = interface_metric(r.InterfaceIndex)?;
+            Some((r.Metric.saturating_add(iface), r.InterfaceIndex))
+        })
+        .min()
+        .map(|(_, index)| index);
+    unsafe { FreeMibTable(table as *const _) };
+    best
+}
+
+/// The interface's IPv4 metric, or None if it is down.
+fn interface_metric(index: u32) -> Option<u32> {
+    let mut row: MIB_IPINTERFACE_ROW = unsafe { std::mem::zeroed() };
+    unsafe { InitializeIpInterfaceEntry(&mut row) };
+    row.Family = AF_INET;
+    row.InterfaceIndex = index;
+    if unsafe { GetIpInterfaceEntry(&mut row) } != NO_ERROR || row.Connected == 0 {
+        return None;
+    }
+    Some(row.Metric)
 }

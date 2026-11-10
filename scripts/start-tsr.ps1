@@ -26,6 +26,9 @@
     powershell -ExecutionPolicy Bypass -File .\start-tsr.ps1 -Install
 
 .EXAMPLE
+    .\start-tsr.ps1 -ExitNode homebox -AllowLan    # internet via homebox, LAN stays direct
+
+.EXAMPLE
     .\start-tsr.ps1 -Status      # is it running? shows the last log lines
 
 .EXAMPLE
@@ -37,6 +40,12 @@ param(
     [string]$TsrDir = '',
     [string]$LoginServer = 'https://controlplane.tailscale.com',
     [string]$AuthKey = '',
+    # Send internet traffic through this exit node (tailnet IP or name).
+    [string]$ExitNode = '',
+    # With -ExitNode: keep the local network (printers, NAS, router) direct.
+    [switch]$AllowLan,
+    # Use subnet routes other machines advertise.
+    [switch]$AcceptRoutes,
 
     # Run in the background at every boot.
     [Parameter(ParameterSetName = 'Install')][switch]$Install,
@@ -60,6 +69,13 @@ $StateFile = Join-Path $DataDir 'tsr.state.json'
 $LogFile = Join-Path $DataDir 'tsr.log'
 # Remembers how the official Tailscale service started, so -Uninstall can restore it.
 $ServiceMarker = Join-Path $DataDir 'tailscale-service-startup.txt'
+
+# Routing options, as tsr flags and as the same switches for this script.
+$routeArgs = @()
+$routeSwitches = @()
+if ($ExitNode) { $routeArgs += @('--exit-node', $ExitNode); $routeSwitches += @('-ExitNode', $ExitNode) }
+if ($AllowLan) { $routeArgs += '--exit-node-allow-lan-access'; $routeSwitches += '-AllowLan' }
+if ($AcceptRoutes) { $routeArgs += '--accept-routes'; $routeSwitches += '-AcceptRoutes' }
 
 if (-not $TsrDir) {
     $TsrDir = if (Test-Path (Join-Path $PSScriptRoot 'tsr.exe')) { $PSScriptRoot }
@@ -97,7 +113,7 @@ if (-not $isAdmin) {
         '-TsrDir', "`"$TsrDir`"",
         '-LoginServer', $LoginServer,
         '-Elevated'
-    )
+    ) + $routeSwitches
     if ($AuthKey) { $argList += @('-AuthKey', $AuthKey) }
     if ($PSCmdlet.ParameterSetName -ne 'Run') { $argList += "-$($PSCmdlet.ParameterSetName)" }
     Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList
@@ -111,7 +127,7 @@ switch ($PSCmdlet.ParameterSetName) {
     while (Test-Path $exe) {
         # tsr reconnects by itself once it is up. It exits when it can't get
         # that far (no network yet at boot, a bad login), so try again.
-        & $exe up --login-server $LoginServer --state $StateFile --log-file $LogFile
+        & $exe up --login-server $LoginServer --state $StateFile --log-file $LogFile @routeArgs
         Start-Sleep -Seconds 10
     }
     exit 1
@@ -179,7 +195,7 @@ switch ($PSCmdlet.ParameterSetName) {
 
     $taskScript = Join-Path $InstallDir 'start-tsr.ps1'
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -WorkingDirectory $InstallDir `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$taskScript`" -Background -LoginServer `"$LoginServer`""
+        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$taskScript`" -Background -LoginServer `"$LoginServer`" $($routeSwitches -join ' ')"
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     # No time limit, run on battery, and restart the task itself if it dies.
@@ -265,7 +281,7 @@ switch ($PSCmdlet.ParameterSetName) {
         Stop-Service -Name 'Tailscale'
     }
 
-    $tsrArgs = @('up', '--login-server', $LoginServer, '--state', (Join-Path $TsrDir 'tsr.state.json'))
+    $tsrArgs = @('up', '--login-server', $LoginServer, '--state', (Join-Path $TsrDir 'tsr.state.json')) + $routeArgs
     if ($AuthKey) { $tsrArgs += @('--auth-key', $AuthKey) }
 
     $Host.UI.RawUI.WindowTitle = 'tsr (Tailscale in Rust)'

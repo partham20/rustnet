@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tsr_control::bypass;
 use tsr_control::tailcfg::DerpMap;
 
 use crate::derp::{self, DerpClient};
@@ -148,6 +149,8 @@ struct Engine {
     derp: HashMap<i32, DerpClient>,
     derp_tx: mpsc::Sender<derp::Received>,
     to_os: mpsc::Sender<Vec<u8>>,
+    /// [`bypass::generation`] the UDP socket was last pinned for.
+    bypass_gen: u32,
 }
 
 /// Bind the WireGuard/disco UDP socket, falling back to any free port when
@@ -194,6 +197,7 @@ pub async fn spawn(
         derp: HashMap::new(),
         derp_tx,
         to_os,
+        bypass_gen: 0,
     };
     // Connect to our home region right away so peers can reach us.
     if e.opts.home_derp != 0 {
@@ -552,6 +556,13 @@ impl Engine {
     }
 
     async fn on_tick(&mut self) {
+        let generation = bypass::generation();
+        if generation != self.bypass_gen {
+            self.bypass_gen = generation;
+            if let Err(e) = bypass::pin_udp(&self.sock) {
+                tracing::warn!("pinning the UDP socket to the physical interface: {e}");
+            }
+        }
         let keys: Vec<_> = self.peers.keys().copied().collect();
         let mut out = vec![0u8; MAX_PACKET];
         for key in keys {

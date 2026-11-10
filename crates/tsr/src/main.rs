@@ -6,11 +6,13 @@
 //! ```
 
 mod logfile;
+mod routes;
 mod state;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use std::collections::BTreeMap;
+use ipnet::{IpNet, Ipv4Net};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -20,8 +22,8 @@ use tsr_control::tailcfg::{
     DerpMap, Hostinfo, MapRequest, MapResponse, NetInfo, Node, NodeId, RegisterRequest,
     RegisterResponseAuth,
 };
-use tsr_control::CAPABILITY_VERSION;
-use tsr_net::engine::{Options, PeerConfig};
+use tsr_control::{bypass, CAPABILITY_VERSION};
+use tsr_net::engine::{EngineHandle, Options, PeerConfig};
 use tsr_net::{packet, tun};
 use url::Url;
 
@@ -76,6 +78,18 @@ struct UpArgs {
     /// Send ICMP echo requests through the tunnel to this tailnet IP and print replies.
     #[arg(long)]
     ping: Option<Ipv4Addr>,
+    /// Send internet traffic through this peer (its tailnet IP or name).
+    /// The peer must be an approved exit node.
+    #[arg(long, value_name = "IP|NAME")]
+    exit_node: Option<String>,
+    /// With --exit-node, keep the local network (10/8, 172.16/12, 192.168/16,
+    /// 169.254/16) off the exit node, so printers, NAS, router etc. stay reachable.
+    #[arg(long)]
+    exit_node_allow_lan_access: bool,
+    /// Use subnet routes that peers advertise (e.g. reach a home LAN through
+    /// a subnet router). Routes overlapping this computer's own LAN are skipped.
+    #[arg(long)]
+    accept_routes: bool,
     /// Relay everything through DERP, never direct UDP (for testing).
     #[arg(long, hide = true)]
     derp_only: bool,
@@ -181,11 +195,9 @@ async fn select_home_derp(map: &DerpMap) -> i32 {
         let region = r.region_id;
         probes.spawn(async move {
             let start = Instant::now();
-            let conn = tokio::time::timeout(
-                Duration::from_secs(3),
-                tokio::net::TcpStream::connect((host, port)),
-            )
-            .await;
+            let conn =
+                tokio::time::timeout(Duration::from_secs(3), bypass::tcp_connect(&host, port))
+                    .await;
             matches!(conn, Ok(Ok(_))).then(|| (start.elapsed(), region))
         });
     }
@@ -218,11 +230,22 @@ async fn up(a: UpArgs) -> Result<()> {
     let st = state::State::load_or_create(&a.login.state)?;
     let disco_key = st.disco_key.clone();
     let hostinfo = hostinfo(&a.login);
+    let use_exit = a.exit_node.is_some() && !a.no_tun;
+    if a.exit_node.is_some() && a.no_tun {
+        tracing::warn!("--exit-node needs the network adapter; ignored with --no-tun");
+    }
+    if use_exit {
+        // Before any connection is made, so none of ours ends up in the tunnel.
+        pin_to_default_interface(0);
+    }
 
     let mut client = ControlClient::connect(&a.login.login_server, &st.machine_key).await?;
     register(&mut client, &st, &hostinfo, a.login.auth_key.clone()).await?;
 
     let sock = tsr_net::engine::bind(a.port).await?;
+    if use_exit {
+        bypass::pin_udp(&sock).context("pinning the UDP socket to the physical interface")?;
+    }
     let port = sock.local_addr()?.port();
     let endpoints = local_endpoints(port, a.derp_only);
     tracing::info!(?endpoints, "advertising endpoints");
@@ -286,6 +309,19 @@ async fn up(a: UpArgs) -> Result<()> {
         (c, None)
     };
 
+    let tun_index = channels.ifindex;
+    let mut os_routes = (!a.no_tun && (use_exit || a.accept_routes))
+        .then(|| tun::Routes::new(&a.tun_name, tun_index));
+    if use_exit {
+        // Follow network changes (Wi-Fi to Ethernet, etc.).
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                pin_to_default_interface(tun_index);
+            }
+        });
+    }
+
     let opts = Options {
         node_private: st.node_key.0,
         disco_private: disco_key.0,
@@ -307,10 +343,15 @@ async fn up(a: UpArgs) -> Result<()> {
 
     let mut netmap = Netmap::default();
     netmap.apply(first);
-    engine.set_peers(netmap.peer_configs()).await?;
+    let mut current_exit = None;
+    apply_netmap(&netmap, &a, &engine, os_routes.as_mut(), &mut current_exit).await?;
 
     loop {
-        match stream.next().await {
+        let next = tokio::select! {
+            r = stream.next() => r,
+            _ = tokio::signal::ctrl_c() => return shutdown(os_routes),
+        };
+        match next {
             Ok(Some(m)) => {
                 if m.keep_alive
                     && m.node.is_none()
@@ -320,7 +361,7 @@ async fn up(a: UpArgs) -> Result<()> {
                     continue;
                 }
                 netmap.apply(m);
-                engine.set_peers(netmap.peer_configs()).await?;
+                apply_netmap(&netmap, &a, &engine, os_routes.as_mut(), &mut current_exit).await?;
                 continue;
             }
             Ok(None) => tracing::warn!("map stream ended"),
@@ -328,13 +369,88 @@ async fn up(a: UpArgs) -> Result<()> {
         }
         // Reconnect, keeping the engine and its sessions.
         stream = loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                _ = tokio::signal::ctrl_c() => return shutdown(os_routes),
+            }
             match reconnect(&a, &st, &map_req, port).await {
                 Ok(s) => break s,
                 Err(e) => tracing::warn!("reconnect: {e:#}"),
             }
         };
     }
+}
+
+/// Ctrl+C: take our routes out again before exiting.
+fn shutdown(routes: Option<tun::Routes>) -> Result<()> {
+    tracing::info!("stopping");
+    drop(routes);
+    Ok(())
+}
+
+/// Pin tsr's own sockets to the interface with the real default route.
+fn pin_to_default_interface(exclude: u32) {
+    match tun::default_interface(exclude) {
+        Some(index) => bypass::set_interface(index),
+        None => tracing::debug!("no default route found; keeping the previous interface"),
+    }
+}
+
+/// Push the netmap into the engine and, with --exit-node / --accept-routes,
+/// into the OS routing table.
+async fn apply_netmap(
+    netmap: &Netmap,
+    a: &UpArgs,
+    engine: &EngineHandle,
+    os_routes: Option<&mut tun::Routes>,
+    current_exit: &mut Option<NodeId>,
+) -> Result<()> {
+    let exit = a.exit_node.as_deref().and_then(|sel| {
+        let found = netmap.exit_node(sel);
+        if found.map(|n| n.id) != *current_exit {
+            match found {
+                Some(n) => tracing::info!(
+                    "using exit node {}{}",
+                    n.name,
+                    if a.exit_node_allow_lan_access {
+                        ", local network stays direct"
+                    } else {
+                        ""
+                    }
+                ),
+                None if current_exit.is_some() => tracing::warn!(
+                    "exit node {sel:?} is gone or no longer offers exit; internet traffic goes direct"
+                ),
+                None => {}
+            }
+            *current_exit = found.map(|n| n.id);
+        }
+        found.map(|n| n.id)
+    });
+    if a.exit_node.is_some() && exit.is_none() {
+        // Log once per netmap is too chatty; once at startup is enough.
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "no peer {:?} offering an exit node (is it approved in the admin console?); internet traffic goes direct",
+                a.exit_node.as_deref().unwrap_or_default()
+            )
+        });
+    }
+    engine
+        .set_peers(netmap.peer_configs(exit, a.accept_routes))
+        .await?;
+    if let Some(r) = os_routes {
+        let mut want = BTreeSet::new();
+        if a.accept_routes {
+            want.extend(netmap.subnet_routes(&routes::local_subnets(&a.tun_name)));
+        }
+        if exit.is_some() {
+            want.extend(routes::exit_routes(a.exit_node_allow_lan_access));
+        }
+        r.set(&want);
+    }
+    Ok(())
 }
 
 async fn reconnect(
@@ -445,7 +561,48 @@ impl Netmap {
         }
     }
 
-    fn peer_configs(&self) -> Vec<PeerConfig> {
+    /// The peer chosen with --exit-node (by tailnet IP, full name or short
+    /// name), if it currently offers to be an exit node.
+    fn exit_node(&self, sel: &str) -> Option<&Node> {
+        let sel = sel.trim_end_matches('.').to_lowercase();
+        let ip: Option<IpAddr> = sel.parse().ok();
+        self.peers
+            .values()
+            .filter(|p| !p.expired)
+            .find(|p| {
+                let name = p.name.trim_end_matches('.').to_lowercase();
+                match ip {
+                    Some(ip) => p.addresses.iter().any(|a| a.addr() == ip),
+                    None => name == sel || name.split('.').next() == Some(sel.as_str()),
+                }
+            })
+            .filter(|p| p.allowed_ips.iter().any(|n| n.prefix_len() == 0))
+    }
+
+    /// Subnet routes advertised by peers (not their own addresses, not exit
+    /// routes), minus any that overlap this computer's own LAN.
+    fn subnet_routes(&self, local: &[Ipv4Net]) -> BTreeSet<Ipv4Net> {
+        let mut out = BTreeSet::new();
+        for p in self.peers.values().filter(|p| !p.expired) {
+            for n in &p.allowed_ips {
+                let IpNet::V4(v4) = n else { continue };
+                if v4.prefix_len() == 0 || p.addresses.contains(n) {
+                    continue;
+                }
+                if routes::overlaps_local(v4, local) {
+                    tracing::debug!(route = %v4, peer = %p.name, "skipping route that overlaps the local network");
+                    continue;
+                }
+                out.insert(v4.trunc());
+            }
+        }
+        out
+    }
+
+    /// Engine config. A peer's own addresses always route to it; its subnet
+    /// routes only with --accept-routes, and the internet only if it is the
+    /// chosen exit node.
+    fn peer_configs(&self, exit: Option<NodeId>, accept_routes: bool) -> Vec<PeerConfig> {
         self.peers
             .values()
             .filter(|p| !p.expired)
@@ -456,7 +613,18 @@ impl Netmap {
                 allowed_ips: if p.allowed_ips.is_empty() {
                     p.addresses.clone()
                 } else {
-                    p.allowed_ips.clone()
+                    p.allowed_ips
+                        .iter()
+                        .filter(|n| {
+                            p.addresses.contains(n)
+                                || if n.prefix_len() == 0 {
+                                    exit == Some(p.id)
+                                } else {
+                                    accept_routes
+                                }
+                        })
+                        .copied()
+                        .collect()
                 },
                 endpoints: p.endpoints.iter().filter_map(|e| e.parse().ok()).collect(),
                 derp_region: p.derp_region(),
