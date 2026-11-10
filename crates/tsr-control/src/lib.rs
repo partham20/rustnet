@@ -6,7 +6,9 @@
 //! * [`dial`]: the `/ts2021` HTTP upgrade that carries the Noise handshake.
 //! * [`tailcfg`]: the subset of Tailscale's JSON wire types we need.
 //! * [`client`]: HTTP/2 over the Noise channel; register and map-poll requests.
+//! * [`bypass`]: keeping tsr's own sockets off the tunnel when an exit node is in use.
 
+pub mod bypass;
 pub mod client;
 pub mod dial;
 pub mod keys;

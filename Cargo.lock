@@ -1319,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "tsr"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -1337,7 +1337,7 @@ dependencies = [
 
 [[package]]
 name = "tsr-control"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "base64",
@@ -1349,6 +1349,7 @@ dependencies = [
  "hkdf",
  "http",
  "ipnet",
+ "libc",
  "rand_core",
  "rustls",
  "serde",
@@ -1359,12 +1360,13 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "webpki-roots 0.26.11",
+ "windows-sys 0.59.0",
  "x25519-dalek",
 ]
 
 [[package]]
 name = "tsr-net"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "boringtun",
@@ -1377,6 +1379,7 @@ dependencies = [
  "tracing",
  "tsr-control",
  "url",
+ "windows-sys 0.59.0",
  "wintun",
 ]
 

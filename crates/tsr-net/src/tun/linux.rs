@@ -104,9 +104,46 @@ pub fn create(cfg: &TunConfig) -> Result<TunChannels> {
             }
         })?;
 
+    let ifindex = ifindex_of(&cfg.name);
     tracing::info!(name = %cfg.name, address = %cfg.address, "TUN device up");
     Ok(TunChannels {
         from_os: in_rx,
         to_os: out_tx,
+        ifindex,
     })
+}
+
+pub fn add_route(name: &str, _ifindex: u32, net: ipnet::Ipv4Net) -> Result<()> {
+    ip(&["route", "replace", &net.to_string(), "dev", name])
+}
+
+pub fn del_route(name: &str, _ifindex: u32, net: ipnet::Ipv4Net) -> Result<()> {
+    ip(&["route", "del", &net.to_string(), "dev", name])
+}
+
+/// Lowest-metric IPv4 default route in /proc/net/route, skipping `exclude`.
+pub fn default_interface(exclude: u32) -> Option<u32> {
+    let table = std::fs::read_to_string("/proc/net/route").ok()?;
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            // Iface Destination Gateway Flags RefCnt Use Metric Mask ...
+            if f.len() < 8 || f[1] != "00000000" || f[7] != "00000000" {
+                return None;
+            }
+            let metric: u32 = f[6].parse().ok()?;
+            let index = ifindex_of(f[0]);
+            (index != 0 && index != exclude).then_some((metric, index))
+        })
+        .min()
+        .map(|(_, index)| index)
+}
+
+fn ifindex_of(name: &str) -> u32 {
+    match std::ffi::CString::new(name) {
+        Ok(c) => unsafe { libc::if_nametoindex(c.as_ptr()) },
+        Err(_) => 0,
+    }
 }

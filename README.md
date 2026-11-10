@@ -22,6 +22,8 @@ Tested on 2026-10-20 against Headscale 0.26.1 and an unmodified `tailscaled`
   traffic for peers it can't reach directly. Tested relay-only (`--derp-only`)
   with ping and HTTP both ways.
 - WireGuard (via boringtun) to every peer, routed by AllowedIPs.
+- Exit nodes with local network access, and accepting subnet routes (tested
+  on Linux against a `tailscaled` 1.84.3 exit node; see "Exit nodes" below).
 - ICMP and TCP both ways: OS `ping` from us to the peer, `tailscale ping`
   from the peer to us, and an HTTP request from the peer to a server behind
   our tunnel.
@@ -59,6 +61,40 @@ Or use `scripts/start-tsr.ps1` (also attached to each release). Put it next to
 `tsr.exe`, then right-click it and choose "Run with PowerShell". It asks for
 admin rights, pauses the official Tailscale service while tsr runs, and starts
 that service again when tsr exits.
+
+### Exit nodes and your local network
+
+To send your internet traffic through another machine on your tailnet (for
+example a Linux box at home running `tailscale up --advertise-exit-node`,
+approved as an exit node in the admin console), while still reaching
+everything on the network you're sitting on:
+
+```
+tsr.exe up --login-server https://controlplane.tailscale.com --exit-node homebox --exit-node-allow-lan-access
+```
+
+- `--exit-node` takes the peer's tailnet IP (`100.x.y.z`) or its name. If that
+  peer isn't online as an approved exit node, tsr logs a warning and internet
+  traffic goes direct.
+- `--exit-node-allow-lan-access` keeps the local network off the exit node:
+  all private and link-local addresses (`10/8`, `172.16/12`, `192.168/16`,
+  `169.254/16`), so the router, printers, NAS and other PCs stay reachable
+  directly. Without it, those go through the exit node too, apart from the
+  subnet your PC is directly on, which Windows always keeps local.
+  Multicast and broadcast (mDNS, SSDP, DHCP) never go to the exit node.
+- `--accept-routes` uses subnet routes that other machines advertise (e.g.
+  `tailscale up --advertise-routes 192.168.1.0/24` at home), so you can reach
+  that LAN from elsewhere. A route that overlaps the LAN you're on is skipped,
+  so being at home doesn't pull home traffic through the tunnel.
+
+tsr keeps its own connections (control, DERP, WireGuard) on the physical
+network adapter, so they don't loop into the tunnel, and follows that adapter
+if it changes (Wi-Fi to Ethernet). Only IPv4 goes through the exit node; IPv6
+traffic still goes out directly. Ctrl+C removes the routes again (they also go
+away with the adapter if tsr is killed).
+
+`start-tsr.ps1` takes the same options as `-ExitNode <name> -AllowLan
+-AcceptRoutes`, also together with `-Install`.
 
 ### Running in the background
 
@@ -161,4 +197,4 @@ Roughly in order of usefulness for a home network:
 4. **MagicDNS**, so names like `nas.home.arpa` work.
 5. IPv6 underlay sockets, zstd map compression, endpoint re-reporting when the
    LAN address changes, key expiry and re-login.
-6. Subnet routes and exit nodes.
+6. IPv6 through exit nodes, and acting as an exit node or subnet router.

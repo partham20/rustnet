@@ -27,5 +27,11 @@ url.workspace = true
 webpki-roots.workspace = true
 x25519-dalek.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
+
 [dev-dependencies]
 tracing-subscriber.workspace = true

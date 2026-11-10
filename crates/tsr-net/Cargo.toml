@@ -22,3 +22,9 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
